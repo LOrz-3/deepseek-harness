@@ -105,6 +105,8 @@ type MaterializeInputs = MaterializeBase & (
       descriptor: SubagentDescriptorData
     }
     agentOptions: AgentOptions
+    factorySignal: AbortSignal
+    startup: Materialization
     composition: ChildComposition
     outputSchema?: ObjectJsonSchema | undefined
   }
@@ -120,6 +122,21 @@ interface Materialization {
   readonly root: Agent
   readonly settled: Promise<void>
   readonly controller: AbortController
+  factoryPending: boolean
+}
+
+/** Resources remain owned when release failed or a factory never returned its handle. */
+interface CleanupDebt {
+  readonly error: unknown
+  readonly resource: Activation | SubagentRun | undefined
+}
+
+/** Distinguishes failed rollback from an ordinary rejected or aborted startup. */
+class StartupCleanupError extends SubagentError {
+  constructor(error: unknown, cleanupError: unknown) {
+    super('Subagent startup rollback failed', 'ACTIVATION_TEARDOWN_FAILED', { cause: new AggregateError([error, cleanupError]) })
+    this.name = 'StartupCleanupError'
+  }
 }
 
 /** Residency state observed by the natural-settlement watcher. */
@@ -149,6 +166,10 @@ export class SubagentManager {
   private readonly ownerCtx: Context
   /** Exact subagent tree roots whose host teardown has closed admission. */
   private readonly closingRoots = new Set<Agent>()
+  /** Concurrent stops share admission closure until every owned release settles. */
+  private readonly stoppingRoots = new Map<Agent, Promise<void>>()
+  private readonly cleanupDebts = new Map<SessionId, CleanupDebt[]>()
+  private readonly reportedFailures = new WeakSet<Activation>()
   /** Sibling names held by creations that have not committed their catalog entry. */
   private readonly names = new SiblingNameReservations()
   private draining = false
@@ -228,7 +249,7 @@ export class SubagentManager {
     } else {
       activation.controller.abort({ kind })
       // The settlement observer reports teardown failures.
-      void this.dispose(activation).catch(() => undefined)
+      void this.dispose(activation).catch((error: unknown) => { this.reportTeardownFailure(activation, error) })
     }
   }
 
@@ -240,7 +261,13 @@ export class SubagentManager {
     this.draining = true
     for (const pending of this.materializations) pending.controller.abort()
     await Promise.all([...this.materializations].map(materialization => materialization.settled))
-    await this.disposeRoots([...this.resident.values()], 'activation(s)')
+    const results = await Promise.allSettled([
+      this.disposeRoots([...this.resident.values()], 'activation(s)'),
+    ])
+    const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    failures.push(...[...this.cleanupDebts.values()].flatMap(debts => debts.map(debt => debt.error)))
+    if (failures.length) throw new SubagentError('Subagent shutdown failed',
+      'ACTIVATION_TEARDOWN_FAILED', { cause: new AggregateError(failures) })
   }
 
   /**
@@ -252,6 +279,9 @@ export class SubagentManager {
     if (this.rootOf(root) !== root) return false
     let observed = false
     while (true) {
+      const debts = this.cleanupDebts.get(root.id)
+      if (debts !== undefined) throw new SubagentError('Subagent cleanup is unverified', 'ACTIVATION_CLEANUP_UNKNOWN',
+        { cause: new AggregateError(debts.map(debt => debt.error)) })
       const pending = [...this.materializations].filter(item => item.root === root)
       const children = [...this.resident.values()].filter(item => item.root === root)
       observed ||= children.some(item => item.kind === 'local' && item.handle.agent.status !== 'idle')
@@ -294,7 +324,54 @@ export class SubagentManager {
     const targets = [...this.resident.values()].filter(item => roots.has(item.root))
     const disposal = this.disposeRoots(targets, 'scoped activation(s)')
     const [disposed] = await Promise.allSettled([disposal, ...pending.map(item => item.settled)])
-    if (disposed.status === 'rejected') throw disposed.reason
+    const failures = [...roots].flatMap(root => (this.cleanupDebts.get(root.id) ?? []).map(debt => debt.error))
+    if (disposed.status === 'rejected') failures.push(disposed.reason)
+    if (failures.length) throw new SubagentError('Subagent tree teardown failed', 'ACTIVATION_TEARDOWN_FAILED',
+      { cause: new AggregateError(failures) })
+  }
+
+  /**
+   * Release current tree work while retaining root residency. Concurrent callers join one transaction.
+   * Unknown cleanup remains a Session debt; a replaced root cannot establish recovery.
+   * @param parents - exact live roots to stop; ordinary members are ignored.
+   * @returns once admitted startup and resource release settle.
+   */
+  async stopDescendants(parents: readonly Agent[]): Promise<void> {
+    const roots = [...new Set(parents)].filter(root => this.ctx.agents.get(root.id) === root && this.rootOf(root) === root)
+    const results = await Promise.allSettled(roots.map(root => this.stopTree(root)))
+    const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    if (failures.length) {
+      const code = failures.every(error => error instanceof SubagentError && error.code === 'ACTIVATION_RESULT_FAILED')
+        ? 'ACTIVATION_RESULT_FAILED' : 'ACTIVATION_TEARDOWN_FAILED'
+      throw new SubagentError('Stopping subagent trees failed', code, { cause: new AggregateError(failures) })
+    }
+  }
+
+  private stopTree(root: Agent): Promise<void> {
+    const stopping = this.stoppingRoots.get(root)
+    if (stopping !== undefined) return stopping
+    const completion = Promise.withResolvers<void>()
+    // Publish before any cancel, disposal, or asynchronous startup can admit more work.
+    this.stoppingRoots.set(root, completion.promise)
+    const stop = async () => {
+      const pending = [...this.materializations].filter(item => item.root === root)
+      for (const item of pending) if (!item.factoryPending) item.controller.abort()
+      const targets = [...this.resident.values()].filter(item => item.root === root)
+      const results = await Promise.allSettled([
+        ...targets.map(activation => this.dispose(activation)), ...pending.map(item => item.settled),
+      ])
+      const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+      failures.push(...(this.cleanupDebts.get(root.id) ?? []).map(debt => debt.error))
+      if (failures.length) {
+        const code = failures.every(error => error instanceof SubagentError && error.code === 'ACTIVATION_RESULT_FAILED')
+          ? 'ACTIVATION_RESULT_FAILED' : 'ACTIVATION_TEARDOWN_FAILED'
+        throw new SubagentError(`Stopping subagent tree ${root.id} failed`, code, { cause: new AggregateError(failures) })
+      }
+    }
+    // Retire the entry before publishing settlement; no later stop can be removed by this transaction.
+    const forget = () => { this.stoppingRoots.delete(root) }
+    void stop().then(() => { forget(); completion.resolve() }, error => { forget(); completion.reject(error) })
+    return completion.promise
   }
 
   /**
@@ -330,7 +407,7 @@ export class SubagentManager {
     path: string | undefined,
   ): Promise<SubagentActivation & { messageId: MessageId }> {
     const parent = spec.parent
-    return this.trackStartup(ancestry.root, spec.signal, async (signal) => {
+    return this.trackStartup(ancestry.root, spec.signal, async (signal, startup) => {
       const persistence = spec.delivery === 'caller' ? this.ctx.get('sessionPersistence') : this.requirePersistence()
       const childId = spec.childId ?? brandString<SessionId>(randomUUID())
       this.assertChildIdAvailable(childId)
@@ -395,6 +472,8 @@ export class SubagentManager {
             descriptor,
           },
           agentOptions,
+          factorySignal: spec.signal,
+          startup,
           composition: { agentPreset: spec.agentPreset },
           signal,
           delivery: spec.delivery,
@@ -483,7 +562,7 @@ export class SubagentManager {
           try {
             await this.dispose(activation)
           } catch (cleanupError: unknown) {
-            this.ctx.logger.warn(`subagent "${activation.childId}" admission rollback failed: ${failureMessage(cleanupError)}`)
+            throw new StartupCleanupError(error, cleanupError)
           }
         }
         throw error
@@ -717,20 +796,21 @@ export class SubagentManager {
     const pool = this.rootPool(inputs.root)
     const releaseSlot = pool.reserve(this.maxActiveSubagents())
     return this.materializeTracked(inputs, releaseSlot).catch((error: unknown) => {
-      releaseSlot()
+      if (!this.cleanupDebts.has(inputs.root.id)) releaseSlot()
       throw error
     })
   }
 
   /** Keep subagent tree shutdown and host waits joined to preparation, publication, and rollback. */
-  private trackStartup<T>(root: Agent, signal: AbortSignal, start: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private trackStartup<T>(root: Agent, signal: AbortSignal, start: (signal: AbortSignal, startup: Materialization) => Promise<T>): Promise<T> {
     this.assertAdmitting(root)
     signal.throwIfAborted()
     const settled = Promise.withResolvers<void>()
     const controller = new AbortController()
-    const materialization: Materialization = { root, settled: settled.promise, controller }
+    const materialization: Materialization = { root, settled: settled.promise, controller, factoryPending: false }
     this.materializations.add(materialization)
-    return start(AbortSignal.any([signal, controller.signal])).catch((error: unknown) => {
+    return start(AbortSignal.any([signal, controller.signal]), materialization).catch((error: unknown) => {
+      if (this.cleanupDebts.has(root.id)) throw error
       if (error instanceof Error && error.name === 'AbortError') this.assertAdmitting(root)
       throw error
     }).finally(() => {
@@ -780,11 +860,17 @@ export class SubagentManager {
     }
   }
 
+  private retainCleanupDebt(root: Agent, error: unknown, resource?: Activation | SubagentRun): void {
+    const debts = this.cleanupDebts.get(root.id) ?? []
+    debts.push({ error, resource })
+    this.cleanupDebts.set(root.id, debts)
+  }
+
   /** Return the subagent tree teardown that closed admission for this exact Agent. */
   private closingTeardownFor(agent: Agent): Agent | 'manager' | undefined {
     if (this.draining) return 'manager'
     const root = this.rootOf(agent)
-    return this.closingRoots.has(root) ? root : undefined
+    return this.closingRoots.has(root) || this.stoppingRoots.has(root) || this.cleanupDebts.has(root.id) ? root : undefined
   }
 
   /** Share one capacity pool across every instance in a subagent tree. */
@@ -814,7 +900,12 @@ export class SubagentManager {
         resource = { kind: 'external', run, controller }
         void run.result.catch(() => undefined)
         try { this.assertChildIdAvailable(run.id) } catch (error: unknown) {
-          await run.dispose()
+          try { await run.dispose() }
+          catch (cleanupError) {
+            const failure = new StartupCleanupError(error, cleanupError)
+            this.retainCleanupDebt(root, failure, run)
+            throw failure
+          }
           throw error
         }
       } finally {
@@ -837,7 +928,7 @@ export class SubagentManager {
           appendDelegatedPolicyOverrides(child.session, create.delegatedPolicies)
           const workingDirectory = childCtx.get('workingDirectory')
           if (workingDirectory === undefined) throw new Error('local subagents require the working-directory service')
-          await workingDirectory.set(child, create.cwd, inputs.signal)
+          await workingDirectory.set(child, create.cwd, inputs.factorySignal)
         }
         if (inputs.composition.agentPreset === undefined) await applyChildComposition(childCtx, create?.parent, inputs.composition)
         if (inputs.outputSchema !== undefined) {
@@ -847,22 +938,33 @@ export class SubagentManager {
           )
         }
       }
-      const handle = create === undefined
-        ? await this.ownerCtx.agents.resume({
+      this.assertAdmitting(root)
+      inputs.factorySignal.throwIfAborted()
+      inputs.startup.factoryPending = true
+      const acquire = () => create === undefined
+        ? this.ownerCtx.agents.resume({
           resumeSessionId: childId,
           agentOptions: inputs.agentOptions,
-          signal: inputs.signal,
+          signal: inputs.factorySignal,
           setup,
         })
-        : await this.ownerCtx.agents.create({
+        : this.ownerCtx.agents.create({
           sessionId: childId,
           meta: create.meta,
           ...(create.seed === undefined ? {} : { seed: create.seed }),
           inheritedEventCount: create.inheritedEventCount,
           agentOptions: inputs.agentOptions,
-          signal: inputs.signal,
+          signal: inputs.factorySignal,
           setup,
         })
+      let handle: Awaited<ReturnType<typeof acquire>>
+      try { handle = await acquire() }
+      catch (error) {
+        const failure = new SubagentError(`Subagent "${childId}" factory rejected before handing over its handle; cleanup is unverified`,
+          'ACTIVATION_CLEANUP_UNKNOWN', { cause: error })
+        this.retainCleanupDebt(root, failure)
+        throw failure
+      } finally { inputs.startup.factoryPending = false }
 
       resource = {
         kind: 'local',
@@ -916,9 +1018,13 @@ export class SubagentManager {
       // after residency and inbox listeners, as the last rollback-protected step.
       this.host.emitLifecycle('subagent/start', this.runInfo(activation), root)
     } catch (error: unknown) {
-      /* v8 ignore next -- rollback failure must not mask the admission failure
-       * that prevented this operation from returning an accepted message id. */
-      await this.rollbackUnpublished(activation, error).catch(() => undefined)
+      try { await this.rollbackUnpublished(activation, error) }
+      catch (cleanupError) {
+        const failure = new StartupCleanupError(error, cleanupError)
+        this.retainCleanupDebt(root, failure, activation)
+        activation.result.reject(failure)
+        throw failure
+      }
       throw error
     }
     return activation
@@ -949,13 +1055,10 @@ export class SubagentManager {
   /** Release an Activation whose start edge was not published. */
   private rollbackUnpublished(activation: Activation, error: unknown): Promise<void> {
     return this.close(activation, async () => {
-      try {
-        await (activation.kind === 'local' ? activation.handle.dispose() : activation.run.dispose())
-      } finally {
-        this.resident.delete(activation.childId)
-        activation.releaseSlot()
-        activation.result.reject(error)
-      }
+      await (activation.kind === 'local' ? activation.handle.dispose() : activation.run.dispose())
+      this.resident.delete(activation.childId)
+      activation.releaseSlot()
+      activation.result.reject(error)
     })
   }
 
@@ -1020,6 +1123,8 @@ export class SubagentManager {
 
   /** Report disposal failure once after the natural settlement observer finishes. */
   private reportTeardownFailure(activation: Activation, error: unknown): void {
+    if (this.reportedFailures.has(activation)) return
+    this.reportedFailures.add(activation)
     this.ctx.logger.warn(`subagent "${activation.childId}" activation teardown failed: ${failureMessage(error)}`)
   }
 
@@ -1043,6 +1148,8 @@ export class SubagentManager {
     let result: SubagentResult = { output: [], stopReason: 'error' }
     let resultFailure: { error: unknown } | undefined
     let externalDisposal: Promise<void> | undefined
+    let externalReleaseFailed = false
+    let resourcesReleased = false
     const child = activationAgent(activation)
     const detail = (error: unknown): string => child === undefined
       ? failureMessage(error)
@@ -1050,12 +1157,27 @@ export class SubagentManager {
     try {
       if (activation.kind === 'external') {
         if (stop) {
+          const observed: { current: { value: SubagentResult } | { error: unknown } | undefined } = { current: undefined }
+          void activation.run.result.then(value => { observed.current = { value } }, error => { observed.current = { error } })
           activation.controller.abort({ kind: 'parent' })
-          // Some backends settle their result only when disposal begins.
           externalDisposal = Promise.resolve().then(() => activation.run.dispose())
-          void externalDisposal.catch(() => undefined)
-        }
-        result = await activation.run.result
+          try { await externalDisposal }
+          catch (error) {
+            externalReleaseFailed = true
+            const terminal = observed.current
+            if (terminal !== undefined && 'error' in terminal) {
+              failures.push(new SubagentError(`subagent "${childId}" terminal result failed: ${detail(terminal.error)}`,
+                'ACTIVATION_RESULT_FAILED', { cause: terminal.error }))
+            }
+            throw error
+          }
+          if (observed.current === undefined) {
+            throw new SubagentError(`subagent "${childId}" resources were released before its terminal result was available`,
+              'ACTIVATION_RESULT_UNAVAILABLE')
+          }
+          if ('error' in observed.current) throw observed.current.error
+          result = observed.current.value
+        } else result = await activation.run.result
       } else {
         if (stop) {
           activation.handle.agent.cancel({ kind: 'parent' })
@@ -1066,16 +1188,19 @@ export class SubagentManager {
         result = captureLocalResult(activation)
       }
     } catch (error: unknown) {
-      resultFailure = { error }
-      failures.push(new SubagentError(
-        `subagent "${childId}" activation teardown failed: ${detail(error)}`,
-        'ACTIVATION_TEARDOWN_FAILED',
-        { cause: error },
-      ))
+      if (!externalReleaseFailed) {
+        resultFailure = { error }
+        failures.push(new SubagentError(
+          `subagent "${childId}" activation teardown failed: ${detail(error)}`,
+          'ACTIVATION_TEARDOWN_FAILED',
+          { cause: error },
+        ))
+      }
     }
     try {
       if (activation.kind === 'local') await activation.handle.dispose()
       else await (externalDisposal ?? activation.run.dispose())
+      resourcesReleased = true
     } catch (error: unknown) {
       failures.push(new SubagentError(
         `subagent "${childId}" activation handle disposal failed: ${detail(error)}`,
@@ -1095,9 +1220,14 @@ export class SubagentManager {
         { cause: new AggregateError(failures) },
       )
     }
-    if (failure !== undefined && result.stopReason === 'completed' && child !== undefined
-      && (child.inbox.nextStep.length > 0 || child.inbox.nextTurn.length > 0)) {
-      result = { ...result, stopReason: 'error' }
+    if (failure !== undefined) {
+      if (!resourcesReleased) {
+        this.retainCleanupDebt(activation.root, failure, activation)
+        activation.result.reject(failure)
+        throw failure
+      }
+      failure = new SubagentError(`subagent "${childId}" resources were released but terminal result collection failed`,
+        'ACTIVATION_RESULT_FAILED', { cause: failure })
     }
     this.resident.delete(childId)
     activation.releaseSlot()
@@ -1212,7 +1342,8 @@ export class SubagentManager {
 
   /** Reconstruct only the target under its subagent tree root; the caller owns acceptance or rollback. */
   private async restoreTarget(root: Agent, childId: SessionId, signal: AbortSignal): Promise<Activation> {
-    return this.trackStartup(root, signal, async (signal) => {
+    const factorySignal = signal
+    return this.trackStartup(root, signal, async (signal, startup) => {
       using source = await this.observeContinuation(childId, signal)
       this.assertAdmitting(root)
       const ownEvents = source.events.slice(source.inheritedEventCount)
@@ -1245,6 +1376,8 @@ export class SubagentManager {
               ? { reasoningEffort: ReasoningEffortId(descriptor.agentReasoningEffort) }
               : {},
           },
+          factorySignal,
+          startup,
           composition: {
             agentPreset: agentPreset ?? undefined,
             persona: descriptor.persona,
@@ -1253,6 +1386,7 @@ export class SubagentManager {
           signal,
         })
       } catch (error: unknown) {
+        if (this.cleanupDebts.has(root.id) || error instanceof StartupCleanupError) throw error
         signal.throwIfAborted()
         if (error instanceof SubagentError) throw error
         throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
@@ -1284,9 +1418,7 @@ export class SubagentManager {
       try {
         await this.dispose(activation)
       } catch (cleanupError: unknown) {
-        this.ctx.logger.warn(
-          `subagent continuation: disposal after admission or catalog append failure also failed: ${String(cleanupError)}`,
-        )
+        throw new StartupCleanupError(error, cleanupError)
       }
       throw error
     }

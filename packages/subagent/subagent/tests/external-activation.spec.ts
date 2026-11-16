@@ -225,7 +225,8 @@ describe('external subagent activations', () => {
       return { ...backend.run, dispose }
     })
     const activation = await fixture.start()
-    const warning = vi.spyOn(fixture.ctx.logger, 'warn')
+    const warning = vi.spyOn(fixture.ctx.logger, 'warn'), ended = vi.fn()
+    fixture.ctx.on('subagent/end', ended)
     const authority = kind === 'user'
       ? { kind, parentSessionId: fixture.parent.id }
       : { kind, agent: fixture.parent }
@@ -248,7 +249,15 @@ describe('external subagent activations', () => {
         backend.cleanup.resolve(undefined)
         await disposal
       }
-      await expect(activation.result).resolves.toEqual(aborted)
+      if (kind === 'ancestor') {
+        await expect(activation.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+        expect(ended).not.toHaveBeenCalled()
+        await expect(fixture.ctx.subagents.stopDescendants([fixture.parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+        await expect(fixture.ctx.subagents.waitForTreeWork(fixture.parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
+      } else {
+        await expect(activation.result).resolves.toEqual(aborted)
+        expect(ended).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stopReason: 'aborted' }))
+      }
       expect(dispose).toHaveBeenCalledTimes(1)
       expect(fixture.parent.inbox.nextTurn).toEqual([])
     } finally {
@@ -305,7 +314,7 @@ describe('external subagent activations', () => {
     }
   })
 
-  it.each(['parent', 'caller'] as const)('preserves the completed result for %s delivery when cleanup fails', async (delivery) => {
+  it.each(['parent', 'caller'] as const)('withholds the completed result for %s delivery when cleanup remains unknown', async (delivery) => {
     const backend = execution()
     const fixture = await setup(async () => backend.run)
     const ended = vi.fn()
@@ -320,29 +329,17 @@ describe('external subagent activations', () => {
     const error = await disposal.catch((error: unknown) => error)
     expect((error as Error).message).not.toContain('SECRET_TOKEN')
     expect((error as Error).message).not.toContain('/private/path')
-    await expect(activation.result).resolves.toEqual(completed)
+    await expect(activation.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
     expect(activation.dispose()).toBe(disposal)
     expect(fixture.records()).toMatchObject(delivery === 'parent' ? [{
       id: activation.childId, mode: 'external',
     }] : [])
-    expect(ended).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stopReason: 'error' }))
-    if (delivery === 'parent') {
-      expect(fixture.parent.inbox.nextTurn).toHaveLength(1)
-      const notice = fixture.parent.inbox.nextTurn[0]!
-      expect(notice.source).toMatchObject({
-        kind: 'subagent-settled', senderSessionId: activation.childId,
-        stopReason: 'completed',
-      })
-      const text = notice.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-      expect(text).toContain('finished')
-      expect(text).toContain('Reviewed three files.')
-      expect(text).toContain('Structured result: {"files":3}')
-      expect(text).not.toContain('failed before it finished')
-      expect(text).not.toContain('SECRET_TOKEN')
-      expect(text).not.toContain('/private/path')
-    } else {
-      expect(fixture.parent.inbox.nextTurn).toEqual([])
-    }
+    expect(ended).not.toHaveBeenCalled()
+    expect(fixture.parent.inbox.nextTurn).toEqual([])
+    expect(fixture.parent.inbox.nextStep).toEqual([])
+    await expect(fixture.ctx.subagents.stopDescendants([fixture.parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(fixture.ctx.subagents.waitForTreeWork(fixture.parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
+    expect(backend.dispose).toHaveBeenCalledTimes(1)
   })
 })
 

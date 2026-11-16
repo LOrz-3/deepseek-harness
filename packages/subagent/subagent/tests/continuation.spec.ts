@@ -18,7 +18,7 @@ import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as SubagentFork from '@deepseek-ai/dsh-subagent-fork-in-process'
 import * as SubagentControl from '@deepseek-ai/dsh-tool-subagent-control'
 import type { ContentBlock, GenerateOptions, MessageId, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { ToolCallId, createUserMessage, LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, createUserMessage, errorChain, LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MockAdapter, maxTokensResponse, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import SubagentRuntime, {
@@ -376,19 +376,20 @@ describe('continuable activation capacity', () => {
     }
   })
 
-  it('reserves the last slot before asynchronous creation and returns it after failure', async () => {
+  it('reserves the last slot before asynchronous creation and retains unknown factory cleanup after rejection', async () => {
     const { ctx, parent } = await setupWith(new MockAdapter([textResponse('replacement')]), { maxActiveSubagents: 1 })
     parkParent(ctx, parent)
     const agents = managerState(ctx).ownerCtx.agents
     const entered = Promise.withResolvers<undefined>()
     const release = Promise.withResolvers<undefined>()
+    const creationFailure = new Error('creation failed')
     const createSpy = vi.spyOn(agents, 'create').mockImplementationOnce(async () => {
       entered.resolve(undefined)
       await release.promise
-      throw new Error('creation failed')
+      throw creationFailure
     })
     const starting = ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
-    const rejected = expect(starting).rejects.toThrow('creation failed')
+    const rejected = expect(starting).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN', cause: creationFailure })
     try {
       await entered.promise
       await expect(ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })).rejects.toMatchObject({ code: 'ACTIVATION_LIMIT_REACHED' })
@@ -396,8 +397,8 @@ describe('continuable activation capacity', () => {
       release.resolve(undefined)
       await rejected
       createSpy.mockRestore()
-      const replacement = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
-      await waitNoActivation(ctx, replacement.childId)
+      await expect(ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })).rejects.toMatchObject({ code: 'DRAINING' })
+      await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
     } finally {
       release.resolve(undefined)
       createSpy.mockRestore()
@@ -496,8 +497,14 @@ describe('continuable activation capacity', () => {
       await expect(ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })).rejects.toMatchObject({ code: 'ACTIVATION_LIMIT_REACHED' })
       releaseDisposal.resolve(undefined)
       expect(await outcome).toEqual(failDisposal ? expect.objectContaining({ code: 'ACTIVATION_TEARDOWN_FAILED' }) : undefined)
-      const replacement = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
-      await waitNoActivation(ctx, replacement.childId)
+      if (failDisposal) {
+        await expect(started.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+        await expect(ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })).rejects.toMatchObject({ code: 'DRAINING' })
+        await expect(ctx.subagents.waitForTreeWork(parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
+      } else {
+        const replacement = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
+        await waitNoActivation(ctx, replacement.childId)
+      }
     } finally {
       releaseRun.resolve(undefined)
       releaseDisposal.resolve(undefined)
@@ -701,14 +708,17 @@ describe('SubagentRuntime.startActivation', () => {
       return appendCatalog('subagent/catalog', data as SessionEventMap['subagent/catalog'])
     }) as typeof parent.session.append)
 
-    await expect(ctx.subagents.startActivation({
+    const failure = await ctx.subagents.startActivation({
       delivery,
       ...startSpec(parent),
       childId,
-    })).rejects.toBe(catalogFailure)
-
+    }).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED',
+      cause: expect.objectContaining({ errors: [catalogFailure, expect.any(SubagentError)] }) })
+    expect(errorChain(failure)).toContain(cleanupFailure.message)
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() })
     expect(parent.session.snapshotEvents().filter(event => event.type === 'subagent/catalog')).toEqual([])
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
   })
 
   it('preserves prompt admission failure when Activation disposal also fails', async () => {
@@ -717,8 +727,6 @@ describe('SubagentRuntime.startActivation', () => {
     const admissionFailure = new Error('prompt admission failed')
     const cleanupFailure = new Error('activation disposal also failed')
     const controller = new AbortController()
-    const warnings: string[] = []
-    ctx.logger.warn = (message: string) => { warnings.push(message) }
     ctx.on('subagent/start', () => {
       const activation = managerState(ctx).resident.get(childId)
       if (activation === undefined) throw new Error('expected live Activation')
@@ -731,15 +739,16 @@ describe('SubagentRuntime.startActivation', () => {
       controller.abort(admissionFailure)
     })
 
-    await expect(ctx.subagents.startActivation({
+    const failure = await ctx.subagents.startActivation({
       delivery: 'parent',
       ...startSpec(parent, 'spawn', controller.signal),
       childId,
-    })).rejects.toBe(admissionFailure)
+    }).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED',
+      cause: expect.objectContaining({ errors: [admissionFailure, expect.any(SubagentError)] }) })
+    expect(errorChain(failure)).toContain(cleanupFailure.message)
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() })
-    expect(warnings.some(warning => warning.startsWith(
-      'subagent continuation: disposal after admission or catalog append failure also failed:',
-    ))).toBe(true)
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
   })
 
   it('rolls an unpublished Activation back when lifecycle publication fails', async () => {
@@ -1205,7 +1214,8 @@ describe('target-only Queue residency routing', () => {
     ctx.agents.resume = () => Promise.reject(failure)
 
     await expect(queuePrompt(ctx, started.childId, message('continue')))
-      .rejects.toBe(failure)
+      .rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN', cause: failure })
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
   })
 
   it('cold-resumes a delivery that lost the race with final disposal', async () => {
@@ -2358,7 +2368,7 @@ describe('continuable review regressions', () => {
     await expect(waiting).resolves.toBe(true)
   })
 
-  it('reports handle-disposal failure on the terminal edge', async () => {
+  it('withholds the terminal edge when handle disposal leaves cleanup unknown', async () => {
     const { ctx, parent } = await setup([textResponse('answer')])
     const ends: SubagentRunEndInfo[] = []
     ctx.on('subagent/end', (info) => { ends.push(info) })
@@ -2376,10 +2386,11 @@ describe('continuable review regressions', () => {
       throw new Error('scoped cleanup failed')
     }
 
-    await expect(drainManager(ctx)).rejects.toThrow()
-    await vi.waitFor(() => { expect(ends).toHaveLength(1) })
-    // Emitting before disposal would have reported this failed epoch as success.
-    expect(ends[0]!.stopReason).toBe('error')
+    await expect(drainManager(ctx)).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(started.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    expect(ends).toEqual([])
+    expect(managerState(ctx).resident.get(started.childId)).toBe(activation)
+    await expect(ctx.subagents.waitForTreeWork(parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
   })
 
   it('reports a pre-disposal teardown failure on the terminal edge', async () => {
@@ -2473,8 +2484,8 @@ describe('continuable review regressions', () => {
       const failure = await drained.catch((error: unknown) => error)
 
       expect(failure).toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
-      expect(String(failure)).toContain('capture failed')
-      expect(String(failure)).toContain('scoped cleanup failed')
+      expect(errorChain(failure)).toContain('capture failed')
+      expect(errorChain(failure)).toContain('scoped cleanup failed')
       expect(ctx.agents.get(started.childId)).toBeUndefined()
     } finally {
       capture.mockRestore()
@@ -3299,7 +3310,7 @@ describe('continuable settlement delivery', () => {
     )
   })
 
-  it('delivers the captured answer when local handle cleanup fails', async () => {
+  it('withholds the captured answer when local handle cleanup remains unknown', async () => {
     const { ctx, parent } = await setup([textResponse('the answer'), textResponse('parent ack')])
     const started = await ctx.subagents.startActivation({ ...startSpec(parent), delivery: 'parent' })
     const activation = await vi.waitFor(() => {
@@ -3315,12 +3326,11 @@ describe('continuable settlement delivery', () => {
     }
 
     await waitNoActivation(ctx, started.childId)
-    await vi.waitFor(() => { expect(settlementNotices(parent)).toHaveLength(1) })
-    expect(settlementNotices(parent)[0]!.text).toBe(
-      `Background subagent ${started.name} finished and will do no further work unless you send it more.\nIts closing message:\nthe answer`,
-    )
-    await expect(started.result).resolves.toMatchObject({ stopReason: 'completed' })
+    await expect(started.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    expect(settlementNotices(parent)).toEqual([])
     await expect(started.dispose()).rejects.toThrow('scope unwind failed')
+    expect(managerState(ctx).resident.get(started.childId)).toBe(activation)
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
   })
 
   it('gives an idle parent one ordinary turn on the notice', async () => {

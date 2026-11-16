@@ -550,6 +550,20 @@ interrupt(targetSessionId: SessionId, authority: SubagentInterruptAuthority): vo
 async drainDescendants(parents: readonly Agent[]): Promise<void>
 
 /**
+ * Stop and release current descendants without ending root residency. Ordinary members are ignored;
+ * without an activation manager there is no work to release. Concurrent stops join one transaction.
+ * Pending local factories hand over their handles before release; caller and owner cancellation still apply.
+ * Unverified cleanup is retained by Session across root replacement; removal does not establish recovery.
+ * After confirmed release, unavailable results at the forced-disposal cutoff reject with
+ * `ACTIVATION_RESULT_FAILED` without preventing later delegation. Late results cannot publish another end.
+ * @param parents - exact live roots whose current descendants must stop.
+ * @returns once all admitted startup and owned resource release have settled.
+ * @throws {SubagentError} `ACTIVATION_TEARDOWN_FAILED` for unverified cleanup, or
+ * `ACTIVATION_RESULT_FAILED` when resources are released but terminal results cannot be collected.
+ */
+async stopDescendants(parents: readonly Agent[]): Promise<void>
+
+/**
  * Recursively list reachable parent catalogs in stable pre-order, preserving
  * each catalog's event order. Each row carries its catalog parent and depth;
  * external children are leaves; one-shot and unknown-mode children remain

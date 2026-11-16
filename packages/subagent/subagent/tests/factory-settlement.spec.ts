@@ -51,14 +51,20 @@ it.each([false, true])('settles an activation after factory unload with queue-cl
     rejectClear()
     expect(ctx.agents.get(started.childId)).toBeUndefined()
     release.resolve(undefined)
-    const stopReason = rejectQueueClear ? 'error' : 'completed'
-    expect(await started.result).toMatchObject({
-      output: [{ type: 'text', text: 'answer' }],
-      stopReason,
-    })
-    expect(state.resident.has(started.childId)).toBe(false)
-    expect(released).toHaveBeenCalledTimes(1)
-    expect(ended).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stopReason }))
+    if (rejectQueueClear) {
+      await expect(started.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+      await expect(started.dispose()).rejects.toThrow('queue clear rejected')
+      expect(state.resident.get(started.childId)).toBe(activation)
+      expect(released).not.toHaveBeenCalled()
+      expect(ended).not.toHaveBeenCalled()
+    } else {
+      expect(await started.result).toMatchObject({
+        output: [{ type: 'text', text: 'answer' }], stopReason: 'completed',
+      })
+      expect(state.resident.has(started.childId)).toBe(false)
+      expect(released).toHaveBeenCalledTimes(1)
+      expect(ended).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stopReason: 'completed' }))
+    }
   } finally {
     release.resolve(undefined)
     await ctx.fiber.dispose()

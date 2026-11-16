@@ -6,7 +6,7 @@ import { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 
-import { HarnessError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { errorChain, HarnessError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { carrierKeyOf } from '@deepseek-ai/dsh-scope'
 import SubagentRuntime, {
   foldSubagentDescriptor,
@@ -437,13 +437,26 @@ describe('SubagentRuntime', () => {
       throw catalogFailure
     })
 
-    await expect(start(subagents, 'catalog-failure', baseRequest({ parent }), 'parent'))
-      .rejects.toBe(catalogFailure)
+    const ended = vi.fn()
+    ctx.on('subagent/end', ended)
+    const failure = await start(subagents, 'catalog-failure', baseRequest({ parent }), 'parent').catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED',
+      cause: expect.objectContaining({ errors: [catalogFailure,
+        expect.objectContaining({ code: failsDisposal ? 'ACTIVATION_TEARDOWN_FAILED' : 'ACTIVATION_RESULT_FAILED' })] }) })
     expect(append).toHaveBeenCalledOnce()
     expect(dispose).toHaveBeenCalledOnce()
-    expect(warnings).toHaveBeenCalledOnce()
-    expect(warnings.mock.calls[0]![0]).toContain('run infrastructure failed')
-    if (failsDisposal) expect(warnings.mock.calls[0]![0]).toContain('dispose also failed')
+    expect(errorChain(failure)).toContain('run infrastructure failed')
+    expect(warnings).not.toHaveBeenCalled()
+    if (failsDisposal) {
+      expect(errorChain(failure)).toContain('dispose also failed')
+      expect(ended).not.toHaveBeenCalled()
+      await expect(subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+      await expect(subagents.waitForTreeWork(parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
+    } else {
+      expect(ended).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stopReason: 'error' }))
+      await expect(subagents.stopDescendants([parent])).resolves.toBeUndefined()
+      await expect(subagents.waitForTreeWork(parent)).resolves.toBe(false)
+    }
   })
 
   it('emits an enriched end event and maps result rejection to error telemetry', async () => {
@@ -487,8 +500,11 @@ describe('SubagentRuntime', () => {
     const failedRun = await start(subagents, 'infra', baseRequest())
     failure.reject(new Error('transport'))
     await expect(failedRun.result).rejects.toThrow('transport')
-    await expect(failedRun.dispose()).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(failedRun.dispose()).rejects.toMatchObject({ code: 'ACTIVATION_RESULT_FAILED' })
     expect(ended).toHaveBeenCalledWith(expect.objectContaining({ provider: 'infra', stopReason: 'error' }))
+    const parent = ctx.agents.get(SessionId('parent-1'))!
+    await expect(subagents.stopDescendants([parent])).resolves.toBeUndefined()
+    await expect(subagents.waitForTreeWork(parent)).resolves.toBe(false)
   })
 
   it('contains synchronous and asynchronous lifecycle observer failures', async () => {
