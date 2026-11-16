@@ -6,7 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import SubagentRuntime from '../src/index.ts'
+import SubagentRuntime, { SubagentError } from '../src/index.ts'
 import type { SubagentStartRequest, SubagentRun, SubagentResult } from '../src/types.ts'
 import { externalTestParent } from './external-activation-helpers.ts'
 
@@ -135,20 +135,19 @@ describe('external activation ownership', () => {
     const fixture = await setup(() => Promise.resolve(run('rollback-child', Promise.resolve(complete), dispose)), 'parent')
     const failure = new Error('catalog unavailable')
     const append = vi.spyOn(fixture.parent.session, 'append').mockImplementationOnce(() => { throw failure })
-    const warning = vi.spyOn(fixture.ctx.logger, 'warn')
     try {
-      await expect(fixture.start()).rejects.toBe(failure)
+      await expect(fixture.start()).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED',
+        cause: expect.objectContaining({ errors: [failure, expect.any(SubagentError)] }) })
       expect(dispose).toHaveBeenCalledOnce()
-      expect(warning).toHaveBeenCalledWith(expect.stringContaining('admission rollback failed:'))
-      expect(warning).toHaveBeenCalledWith(expect.stringContaining('unknown teardown failure'))
-      await expect(fixture.ctx.subagents.waitForTreeWork(fixture.parent)).resolves.toBe(false)
+      await expect(fixture.ctx.subagents.waitForTreeWork(fixture.parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
+      await expect(fixture.ctx.subagents.stopDescendants([fixture.parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+      await expect(fixture.start()).rejects.toMatchObject({ code: 'DRAINING' })
     } finally {
       append.mockRestore()
-      warning.mockRestore()
     }
   })
 
-  it('contains a non-Error backend cleanup rejection and retains the execution result', async () => {
+  it('contains a non-Error backend cleanup rejection without claiming execution completion', async () => {
     const result = Promise.withResolvers<SubagentResult>()
     const cleanup = Promise.withResolvers<undefined>()
     const fixture = await setup(() => Promise.resolve(run('failed-cleanup', result.promise, () => cleanup.promise)))
@@ -158,7 +157,8 @@ describe('external activation ownership', () => {
     const rejected = expect(disposal).rejects.toThrow('unknown teardown failure')
     cleanup.reject({ private: 'SECRET_TOKEN' })
     await rejected
-    await expect(activation.result).resolves.toEqual(complete)
+    await expect(activation.result).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(fixture.ctx.subagents.stopDescendants([fixture.parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
     expect((await disposal.catch((error: unknown) => error) as Error).message).not.toContain('SECRET_TOKEN')
   })
 })

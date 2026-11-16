@@ -138,9 +138,11 @@ describe('child preset start validation', () => {
     const spec = startSpec(parent, 'reviewing')
 
     await expect(ctx.subagents.startActivation(spec)).rejects.toMatchObject({
-      code: 'PRESET_UNAVAILABLE',
-      message: 'selecting a child agent preset requires the agent-presets service',
+      code: 'ACTIVATION_CLEANUP_UNKNOWN',
+      cause: { code: 'PRESET_UNAVAILABLE', message: 'selecting a child agent preset requires the agent-presets service' },
     })
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(ctx.subagents.startActivation(spec)).rejects.toMatchObject({ code: 'DRAINING' })
     expect(ctx.agents.list().map(agent => agent.id)).toEqual([parent.id])
     expect(ctx.sessions.list()).toHaveLength(beforeSessions)
     expect(parent.session.snapshotEvents()).toEqual(beforeEvents)
@@ -308,8 +310,10 @@ describe('continuable child presets', () => {
     expect(created.events.slice(created.inheritedEventCount).some(event => event.type === 'agent-preset/selected')).toBe(false)
     await unregister.get('reviewing')!()
     await expect(continueChild(ctx, started.childId)).rejects.toMatchObject({
-      code: 'NOT_RESUMABLE', cause: { code: 'agent-preset/not-found' },
+      code: 'ACTIVATION_CLEANUP_UNKNOWN', cause: { code: 'agent-preset/not-found' },
     })
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(continueChild(ctx, started.childId)).rejects.toMatchObject({ code: 'DRAINING' })
     expect(adapter.requests).toHaveLength(2)
     expect(ctx.tools.schemas(parent).map(tool => tool.name)).toEqual(['reviewing_only'])
   })
@@ -325,9 +329,12 @@ describe('continuable child presets', () => {
     }
 
     await expect(continueChild(ctx, started.childId)).rejects.toMatchObject({
-      code: 'NOT_RESUMABLE',
+      code: 'ACTIVATION_CLEANUP_UNKNOWN',
       cause: { code: failure === 'missing' ? 'agent-preset/not-found' : 'agent-preset/invalid' },
     })
+    expect(ctx.agents.get(started.childId)).toBeUndefined()
+    await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+    await expect(continueChild(ctx, started.childId)).rejects.toMatchObject({ code: 'DRAINING' })
     const stored = await settled(ctx, started.childId)
     expect(adapter.requests).toHaveLength(1)
     expect(stored.events.slice(0, created.events.length)).toEqual(created.events)

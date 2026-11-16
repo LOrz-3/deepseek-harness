@@ -101,7 +101,10 @@ describe('subagent working directories', () => {
         provider: 'spawn', label: 'unavailable directory service', childId,
         parent, cwd: second, prompt: [{ type: 'text', text: 'child' }],
         signal: new AbortController().signal,
-      })).rejects.toThrow(/subagents require the working-directory service/)
+      })).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN',
+        cause: { message: expect.stringMatching(/subagents require the working-directory service/) } })
+      await expect(ctx.subagents.stopDescendants([parent])).rejects.toMatchObject({ code: 'ACTIVATION_TEARDOWN_FAILED' })
+      await expect(ctx.subagents.waitForTreeWork(parent)).rejects.toMatchObject({ code: 'ACTIVATION_CLEANUP_UNKNOWN' })
 
       expect(ctx.agents.list().map(agent => agent.id)).toEqual([parent.id])
       expect(parent.session.snapshotEvents().filter(event => event.type === 'subagent/catalog')).toEqual([])
